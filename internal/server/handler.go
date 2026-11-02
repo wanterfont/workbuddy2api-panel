@@ -282,6 +282,9 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.Pool != nil {
 		h.mux.HandleFunc("GET /v1/balance", h.withAuth(magpie.Balance(cfg.Pool)))
 	}
+	if cfg.Usage != nil {
+		h.mux.HandleFunc("GET /v1/usage/daily", h.withAuth(magpie.DailyHandler(cfg.Usage, nil)))
+	}
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
