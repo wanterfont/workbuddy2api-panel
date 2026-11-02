@@ -21,6 +21,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/httpauth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/magpie"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/prompt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
@@ -275,6 +276,12 @@ func NewHandler(cfg Config) *Handler {
 	// OpenAI 系客户端用 Bearer，两种携带方式都必须放行（见 withDualAuth）。
 	h.mux.HandleFunc("GET /v1/models", h.withDualAuth(h.models))
 	h.mux.HandleFunc("GET /v1/capacity", h.withAuth(h.capacity))
+	// --- magpie 插件支持（见 internal/magpie/README.md）---
+	// 只读额度端点，与 /v1/capacity 同一套 withAuth；纯读池快照，不发上游请求。
+	// 删除本段 + internal/magpie/ 即可完全回到上游原状。
+	if cfg.Pool != nil {
+		h.mux.HandleFunc("GET /v1/balance", h.withAuth(magpie.Balance(cfg.Pool)))
+	}
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
