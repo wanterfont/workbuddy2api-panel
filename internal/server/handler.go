@@ -1122,18 +1122,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// session.ExtractKey 的 anti-monopoly 闸）时用内容派生键——否则这些客户端的
 	// prompt_cache_key 退化成每账号一个常量槽，同账号上多段对话互相覆盖前缀缓存
 	// （issue #5：glm-5.3 大上下文周期性命中率掉到 0.2%）。
-	// 只供缓存槽使用：账号绑定仍只认 sessKey，不复活 user 维度粘性。
 	cacheKeyID := sessKey
 	if cacheKeyID == "" {
 		cacheKeyID = session.DeriveCacheKey(body)
 	}
+	// 账号粘性也认这个派生键：上游前缀缓存按账号隔离（cache_key 里掺 uid），
+	// 账号一换就是全量 miss。只发 user_id 的客户端（ExtractKey 的 anti-monopoly
+	// 闸返回空）此前每轮都被轮换到新号——实测同一份 3.6k body 连发两次，落两个
+	// 不同账号、miss 3634/3634；带 conversation_id 或什么都不带时第二轮命中
+	// 3456/3634（95%）。派生键是 system+首条 user 的内容哈希，天然是**对话级**
+	// 而非用户级：同一用户的并行对话首条 user 不同 → 键不同 → 照旧分散，原契约
+	// 想避免的「一个 user 全钉在同一号」不会发生；相对的是每条 8k 前缀从 0.02
+	// credit 涨到 0.34（cache_key.go 实测，17×）。
+	bindKey := sessKey
+	if bindKey == "" {
+		bindKey = cacheKeyID
+	}
 	stickyUID := ""
-	if h.cfg.Session != nil && sessKey != "" {
+	if h.cfg.Session != nil && bindKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
 		// 用 routeModel 而非 peek.Model（issue #30）：映射后必须按真实模型的
 		// 可用性口径判绑定，别名名不在任何账本里。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, routeModel); ok {
+		if uid, ok := h.cfg.Session.ResolveForModel(bindKey, routeModel); ok {
 			stickyUID = uid
 		}
 	}
@@ -1167,7 +1178,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 	unbindSticky := func() {
 		if stickyUID != "" {
-			h.cfg.Session.Unbind(sessKey)
+			h.cfg.Session.Unbind(bindKey)
 			stickyUID = ""
 		}
 	}
@@ -1736,8 +1747,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.BlockModelClear(acct.UID, curModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+		if bindKey != "" && h.cfg.Session != nil {
+			h.cfg.Session.Bind(bindKey, acct.UID)
 		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
@@ -1745,7 +1756,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 截断自动续写（见 continue.go）：上游 finish_reason=length 且为纯文本/推理
 			// 段时，同账号同模型补发「已输出内容+续写指令」，多段拼成一条客户端可见流。
 			// 显式限额 / 工具参数截断 / 续写请求失败 → 自动降级为今天的截断终态。
-			cont := newContinueReader(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc)
+			// 本轮生效档位对应的输出预算下限：续写/救援段从原始 body 重建，靠它把
+			// max_tokens 补回可用值（见 upstream.MinOutputBudget 的说明）。
+			cont := newContinueReaderWithFloor(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc,
+				upstream.MinOutputBudget(hopTiming.Effort))
 			defer cont.Close()
 			stats := newChatStatsReaderSince(cont, st.start)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
@@ -1758,7 +1772,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			repair := upstream.NewMarkupRepair(declaredTools, true)
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}), upstream.WithMarkupRepair(repair), upstream.WithModelEcho(modelEcho))
+			}), upstream.WithMarkupRepair(repair), upstream.WithModelEcho(modelEcho),
+				// 客户端已断开时上游只是被动跟随，别把断流记成上游故障（日志归因）。
+				upstream.WithClientGoneFn(func() bool { return r.Context().Err() != nil }))
 			// 首帧否决（见 upstream.HeadVetoError）：网关一个字节都没写出，这次尝试对
 			// 客户端完全无痕——按错误类型处置账号后换号，而不是把「HTTP 200 + error 帧」
 			// 透给客户端（SSE 发过字节就改不了状态码，此前只能这么兜底）。
@@ -1906,7 +1922,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 空截断救援（见 starved.go）：额度被思考吃光、正文零字节。非流式这一侧
 		// 没有 continueReader，救援在这里做——同预算关思考重发一次、重新聚合。
 		if aggregateStarved(resp) && bodyHasOutputLimit(body) {
-			if rb, ok := starvedRetryBody(body); ok {
+			if rb, ok := starvedRetryBodyWithFloor(body, upstream.MinOutputBudget(hopTiming.Effort)); ok {
 				if rc2, st2, _, e2 := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, rb, clientIP, chatMeta, nil); e2 == nil && st2 < 400 && rc2 != nil {
 					if resp2, e3 := upstream.Aggregate(rc2); e3 == nil {
 						rc2.Close()
