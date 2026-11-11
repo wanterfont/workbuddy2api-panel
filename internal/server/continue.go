@@ -118,6 +118,13 @@ type continueReader struct {
 	toolOnlyTried bool
 	// toolOnly 当前段处于「只采纳工具调用」模式：正文/思考增量全部丢弃。
 	toolOnly bool
+	// toolCallBuf 只在 toolOnly 段暂存工具调用帧：判为「重发上一次调用」时整段丢弃，
+	// 否则 settleToolOnly 里按原顺序补发（见那里的说明）。
+	toolCallBuf []string
+	// toolCallNames/toolCallArgs 按 index 累积续写段的工具调用（name 与 arguments 都
+	// 分片到达），用于与请求体历史里上一次执行的调用做同名同参比较。
+	toolCallNames map[int]string
+	toolCallArgs  map[int]string
 	// origFinish/origTail 首段的终态帧：续写段没给工具调用时原样回放。
 	origFinish string
 	origTail   []string
@@ -284,6 +291,7 @@ func (r *continueReader) frame(payload string) {
 	}
 	deltaNonEmpty := false
 	rebuilt := false
+	bufferedToolFrame := false // 本帧只含工具调用且处于 toolOnly 段：入缓存不下发
 	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
 		if c, ok := chs[0].(map[string]any); ok {
 			if d, ok := c["delta"].(map[string]any); ok {
@@ -315,6 +323,12 @@ func (r *continueReader) frame(payload string) {
 				if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
 					r.toolSeen = true
 					deltaNonEmpty = true
+					// 「只采纳工具调用」段：先攒着不下发——settleToolOnly 要拿它跟历史上
+					// 上一次执行过的调用比对，判为重发就整段丢弃（见那里的说明）。
+					if r.toolOnly {
+						r.captureToolCallDeltas(tcs)
+						bufferedToolFrame = true
+					}
 				}
 			}
 			if fr, ok := c["finish_reason"].(string); ok && fr != "" {
@@ -345,6 +359,10 @@ func (r *continueReader) frame(payload string) {
 	}
 	if hasUsage && !deltaNonEmpty {
 		return // 纯 usage 帧（已入账）：不再下发
+	}
+	if bufferedToolFrame {
+		r.toolCallBuf = append(r.toolCallBuf, payload)
+		return
 	}
 	r.emit(payload)
 }
@@ -538,8 +556,8 @@ func (r *continueReader) endSegment(sawDone bool) {
 	// 没有这行就分不清「救回来是工具调用（回合继续）」和「只是多打了一段正文」——
 	// 线上实测命中率能到请求量的三成，必须能算清楚收益再决定判据要不要收。
 	if r.narrationTried {
-		log.Printf("[narration] acct=%s 结果：共 %d 段，工具调用=%v，正文合计=%dB",
-			logfmt.Label(r.acct.UID, r.acct.Nickname), r.seg+1, r.toolSeen, r.text.Len())
+		log.Printf("[narration] acct=%s model=%s 结果：共 %d 段，工具调用=%v，正文合计=%dB",
+			logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg+1, r.toolSeen, r.text.Len())
 	}
 	r.done = true
 }
